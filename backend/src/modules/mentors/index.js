@@ -1,587 +1,697 @@
 const express = require('express');
-const { supabaseAdmin } = require('../../supabaseClient');
+const { supabaseAdmin, createScopedClient } = require('../../supabaseClient');
 const requireAuth = require('../../middleware/requireAuth');
 const requireRole = require('../../middleware/requireRole');
 
 const router = express.Router();
 
-// Apply auth and role protection for all mentor routes
-router.use(requireAuth);
-router.use(requireRole('mentor', 'teacher', 'admin'));
+const ADMISSION_STAGES = ['looking', 'applied', 'offer_received'];
+const STAFF_ROLES = ['mentor', 'teacher'];
+const ALL_ROLES = ['student', 'mentor', 'teacher', 'admin'];
 
-const VALID_ADMISSION_STAGES = ['looking', 'applied', 'offer_received'];
-const VALID_ATTENDANCE_STATUSES = ['present', 'absent', 'excused'];
+// Every route below requires an authenticated admin. The caller's own role
+// is what RLS's admin_all policies check (current_user_role() = 'admin'),
+// so all table reads/writes run through the caller's own scoped client —
+// service-role (supabaseAdmin) is used only where Supabase leaves no
+// alternative: creating/deleting auth.users accounts and listing emails.
+router.use(requireAuth, requireRole('admin'));
 
-/**
- * GET /api/mentors/me/students
- * List of students assigned to this mentor only
- */
-router.get('/me/students', async (req, res) => {
-  try {
-    const mentorId = req.user.id;
+function db(req) {
+  return createScopedClient(req.token);
+}
 
-    // Fetch students assigned to this mentor
-    const { data: students, error: studentsError } = await supabaseAdmin
-      .from('students')
-      .select('id, admission_stage, course_id, mentor_id, university_id, bio')
-      .eq('mentor_id', mentorId);
+async function createAuthUser({ email, password, full_name, role, phone }) {
+  const { data: created, error: createError } = await supabaseAdmin.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+  });
+  if (createError) throw { status: 400, message: createError.message };
 
-    if (studentsError) {
-      return res.status(500).json({ error: studentsError.message });
-    }
+  const userId = created.user.id;
+  const { error: profileError } = await supabaseAdmin
+    .from('users_profile')
+    .insert({ id: userId, full_name, role, phone: phone || null });
 
-    if (!students || students.length === 0) {
-      return res.json([]);
-    }
-
-    const studentIds = students.map((s) => s.id);
-    const courseIds = [...new Set(students.map((s) => s.course_id).filter(Boolean))];
-    const universityIds = [...new Set(students.map((s) => s.university_id).filter(Boolean))];
-
-    // Fetch related users_profile
-    const { data: profiles } = await supabaseAdmin
-      .from('users_profile')
-      .select('id, full_name, phone, created_at')
-      .in('id', studentIds);
-
-    const profileMap = new Map((profiles || []).map((p) => [p.id, p]));
-
-    // Fetch related courses
-    let courseMap = new Map();
-    if (courseIds.length > 0) {
-      const { data: courses } = await supabaseAdmin
-        .from('courses')
-        .select('id, name, category')
-        .in('id', courseIds);
-      courseMap = new Map((courses || []).map((c) => [c.id, c]));
-    }
-
-    // Fetch related universities
-    let universityMap = new Map();
-    if (universityIds.length > 0) {
-      const { data: universities } = await supabaseAdmin
-        .from('universities')
-        .select('id, name, country, fellowship_available')
-        .in('id', universityIds);
-      universityMap = new Map((universities || []).map((u) => [u.id, u]));
-    }
-
-    // Fetch notes count for each student
-    const { data: notes } = await supabaseAdmin
-      .from('mentor_notes')
-      .select('student_id')
-      .in('student_id', studentIds);
-
-    const notesCountMap = new Map();
-    (notes || []).forEach((n) => {
-      notesCountMap.set(n.student_id, (notesCountMap.get(n.student_id) || 0) + 1);
-    });
-
-    const enrichedStudents = students.map((student) => {
-      const profile = profileMap.get(student.id) || {};
-      const course = student.course_id ? courseMap.get(student.course_id) : null;
-      const university = student.university_id ? universityMap.get(student.university_id) : null;
-
-      return {
-        id: student.id,
-        full_name: profile.full_name || 'Unknown Student',
-        phone: profile.phone || null,
-        joined_at: profile.created_at || null,
-        admission_stage: student.admission_stage || 'looking',
-        bio: student.bio || '',
-        course_id: student.course_id,
-        course_name: course ? course.name : null,
-        course_category: course ? course.category : null,
-        university_id: student.university_id,
-        university_name: university ? university.name : null,
-        university_country: university ? university.country : null,
-        notes_count: notesCountMap.get(student.id) || 0,
-      };
-    });
-
-    return res.json(enrichedStudents);
-  } catch (err) {
-    console.error('Error fetching mentor students:', err);
-    return res.status(500).json({ error: 'Internal server error fetching students' });
+  if (profileError) {
+    await supabaseAdmin.auth.admin.deleteUser(userId);
+    throw { status: 400, message: profileError.message };
   }
-});
 
-/**
- * GET /api/mentors/me/students/:id
- * Detail view of one assigned student
- */
-router.get('/me/students/:id', async (req, res) => {
+  return userId;
+}
+
+// ===================================================================
+// STUDENTS
+// ===================================================================
+
+// GET /api/admin/students?search=&stage=&course_id=&mentor_id=
+router.get('/students', async (req, res) => {
+  const { search, stage, course_id, mentor_id } = req.query;
+  const client = db(req);
+
   try {
-    const mentorId = req.user.id;
-    const studentId = req.params.id;
+    let query = client.from('students').select('id, admission_stage, course_id, mentor_id, university_id, bio');
+    if (stage) query = query.eq('admission_stage', stage);
+    if (course_id) query = query.eq('course_id', course_id);
+    if (mentor_id) query = query.eq('mentor_id', mentor_id);
 
-    // Verify student is assigned to this mentor
-    const { data: student, error: studentError } = await supabaseAdmin
-      .from('students')
-      .select('id, admission_stage, course_id, mentor_id, university_id, bio')
-      .eq('id', studentId)
-      .eq('mentor_id', mentorId)
-      .single();
+    const { data: students, error } = await query;
+    if (error) throw error;
 
-    if (studentError || !student) {
-      return res.status(404).json({ error: 'Student not found or not assigned to you' });
-    }
+    const ids = (students || []).map((s) => s.id);
+    const mentorIds = [...new Set((students || []).map((s) => s.mentor_id).filter(Boolean))];
+    const courseIds = [...new Set((students || []).map((s) => s.course_id).filter(Boolean))];
 
-    // Fetch profile
-    const { data: profile } = await supabaseAdmin
-      .from('users_profile')
-      .select('id, full_name, phone, created_at')
-      .eq('id', studentId)
-      .single();
+    const [{ data: profiles }, { data: mentorProfiles }, { data: courses }] = await Promise.all([
+      ids.length ? client.from('users_profile').select('id, full_name, phone').in('id', ids) : Promise.resolve({ data: [] }),
+      mentorIds.length
+        ? client.from('users_profile').select('id, full_name').in('id', mentorIds)
+        : Promise.resolve({ data: [] }),
+      courseIds.length ? client.from('courses').select('id, name').in('id', courseIds) : Promise.resolve({ data: [] }),
+    ]);
 
-    // Fetch course details
-    let course = null;
-    if (student.course_id) {
-      const { data: courseData } = await supabaseAdmin
-        .from('courses')
-        .select('id, name, description, category')
-        .eq('id', student.course_id)
-        .single();
-      course = courseData;
-    }
+    const profileMap = Object.fromEntries((profiles || []).map((p) => [p.id, p]));
+    const mentorMap = Object.fromEntries((mentorProfiles || []).map((p) => [p.id, p.full_name]));
+    const courseMap = Object.fromEntries((courses || []).map((c) => [c.id, c.name]));
 
-    // Fetch university details
-    let university = null;
-    if (student.university_id) {
-      const { data: universityData } = await supabaseAdmin
-        .from('universities')
-        .select('id, name, country, fellowship_available')
-        .eq('id', student.university_id)
-        .single();
-      university = universityData;
-    }
-
-    // Fetch notes timeline
-    const { data: notes } = await supabaseAdmin
-      .from('mentor_notes')
-      .select('id, mentor_id, student_id, note_text, created_at')
-      .eq('student_id', studentId)
-      .order('created_at', { ascending: false });
-
-    // Fetch attendance history for this student
-    const { data: attendanceRecords } = await supabaseAdmin
-      .from('attendance')
-      .select('id, class_id, status')
-      .eq('student_id', studentId);
-
-    let detailedAttendance = [];
-    if (attendanceRecords && attendanceRecords.length > 0) {
-      const classIds = attendanceRecords.map((a) => a.class_id).filter(Boolean);
-      const { data: classes } = await supabaseAdmin
-        .from('classes')
-        .select('id, session_date, topic, course_id')
-        .in('id', classIds);
-
-      const classMap = new Map((classes || []).map((c) => [c.id, c]));
-
-      detailedAttendance = attendanceRecords
-        .map((a) => {
-          const cls = classMap.get(a.class_id) || {};
-          return {
-            id: a.id,
-            class_id: a.class_id,
-            status: a.status,
-            session_date: cls.session_date || null,
-            topic: cls.topic || 'Untitled Class',
-          };
-        })
-        .sort((a, b) => new Date(b.session_date || 0) - new Date(a.session_date || 0));
-    }
-
-    // Fetch test results
-    const { data: testResults } = await supabaseAdmin
-      .from('test_results')
-      .select('id, test_id, score, submitted_at')
-      .eq('student_id', studentId)
-      .order('submitted_at', { ascending: false });
-
-    let detailedTestResults = [];
-    if (testResults && testResults.length > 0) {
-      const testIds = testResults.map((t) => t.test_id).filter(Boolean);
-      const { data: testItems } = await supabaseAdmin
-        .from('tests')
-        .select('id, title, course_id')
-        .in('id', testIds);
-
-      const testMap = new Map((testItems || []).map((t) => [t.id, t]));
-
-      detailedTestResults = testResults.map((tr) => {
-        const test = testMap.get(tr.test_id) || {};
-        return {
-          id: tr.id,
-          test_id: tr.test_id,
-          title: test.title || 'Untitled Test',
-          score: tr.score,
-          submitted_at: tr.submitted_at,
-        };
-      });
-    }
-
-    // Fetch progress summaries
-    const { data: summaries } = await supabaseAdmin
-      .from('progress_summaries')
-      .select('id, summary_text, generated_at, generated_by')
-      .eq('student_id', studentId)
-      .order('generated_at', { ascending: false });
-
-    return res.json({
-      student: {
-        id: student.id,
-        full_name: profile?.full_name || 'Unknown Student',
-        phone: profile?.phone || null,
-        joined_at: profile?.created_at || null,
-        admission_stage: student.admission_stage || 'looking',
-        bio: student.bio || '',
-        course,
-        university,
-      },
-      notes: notes || [],
-      attendance: detailedAttendance,
-      test_results: detailedTestResults,
-      summaries: summaries || [],
-    });
-  } catch (err) {
-    console.error('Error fetching student detail:', err);
-    return res.status(500).json({ error: 'Internal server error fetching student details' });
-  }
-});
-
-/**
- * PATCH /api/mentors/me/students/:id/stage
- * Update admission_stage (looking -> applied -> offer_received)
- */
-router.patch('/me/students/:id/stage', async (req, res) => {
-  try {
-    const mentorId = req.user.id;
-    const studentId = req.params.id;
-    const stage = req.body.admission_stage || req.body.stage;
-
-    if (!stage || !VALID_ADMISSION_STAGES.includes(stage)) {
-      return res.status(400).json({
-        error: `Invalid admission stage. Must be one of: ${VALID_ADMISSION_STAGES.join(', ')}`,
-      });
-    }
-
-    // Verify ownership
-    const { data: student, error: fetchError } = await supabaseAdmin
-      .from('students')
-      .select('id, mentor_id')
-      .eq('id', studentId)
-      .eq('mentor_id', mentorId)
-      .single();
-
-    if (fetchError || !student) {
-      return res.status(404).json({ error: 'Student not found or not assigned to you' });
-    }
-
-    const { error: updateError } = await supabaseAdmin
-      .from('students')
-      .update({ admission_stage: stage })
-      .eq('id', studentId);
-
-    if (updateError) {
-      return res.status(500).json({ error: updateError.message });
-    }
-
-    return res.json({
-      message: 'Admission stage updated successfully',
-      student_id: studentId,
-      admission_stage: stage,
-    });
-  } catch (err) {
-    console.error('Error updating admission stage:', err);
-    return res.status(500).json({ error: 'Internal server error updating stage' });
-  }
-});
-
-/**
- * POST /api/mentors/me/notes
- * Add a free-text note for an assigned student
- */
-router.post('/me/notes', async (req, res) => {
-  try {
-    const mentorId = req.user.id;
-    const { student_id, note_text } = req.body || {};
-
-    if (!student_id || !note_text || typeof note_text !== 'string' || !note_text.trim()) {
-      return res.status(400).json({ error: 'student_id and non-empty note_text are required' });
-    }
-
-    // Verify student ownership
-    const { data: student, error: studentError } = await supabaseAdmin
-      .from('students')
-      .select('id, mentor_id')
-      .eq('id', student_id)
-      .eq('mentor_id', mentorId)
-      .single();
-
-    if (studentError || !student) {
-      return res.status(404).json({ error: 'Student not found or not assigned to you' });
-    }
-
-    const { data: createdNote, error: insertError } = await supabaseAdmin
-      .from('mentor_notes')
-      .insert({
-        mentor_id: mentorId,
-        student_id,
-        note_text: note_text.trim(),
-      })
-      .select('id, mentor_id, student_id, note_text, created_at')
-      .single();
-
-    if (insertError) {
-      return res.status(500).json({ error: insertError.message });
-    }
-
-    return res.status(201).json(createdNote);
-  } catch (err) {
-    console.error('Error adding mentor note:', err);
-    return res.status(500).json({ error: 'Internal server error adding note' });
-  }
-});
-
-/**
- * POST /api/mentors/me/attendance
- * Mark attendance for a class session (create classes row if needed, then insert/upsert attendance rows)
- */
-router.post('/me/attendance', async (req, res) => {
-  try {
-    const mentorId = req.user.id;
-    const { class_id, course_id, session_date, topic, records } = req.body || {};
-
-    if (!Array.isArray(records) || records.length === 0) {
-      return res.status(400).json({ error: 'records array with student attendance is required' });
-    }
-
-    // Validate attendance statuses
-    for (const record of records) {
-      if (!record.student_id || !VALID_ATTENDANCE_STATUSES.includes(record.status)) {
-        return res.status(400).json({
-          error: `Invalid record: student_id is required and status must be one of: ${VALID_ATTENDANCE_STATUSES.join(', ')}`,
-        });
-      }
-    }
-
-    let targetClassId = class_id;
-    let classRecord = null;
-
-    if (targetClassId) {
-      // Verify class belongs to mentor
-      const { data: existingClass, error: classError } = await supabaseAdmin
-        .from('classes')
-        .select('*')
-        .eq('id', targetClassId)
-        .eq('mentor_id', mentorId)
-        .single();
-
-      if (classError || !existingClass) {
-        return res.status(404).json({ error: 'Class session not found or not owned by you' });
-      }
-
-      classRecord = existingClass;
-    } else {
-      // Create new class session
-      if (!session_date || !topic) {
-        return res.status(400).json({
-          error: 'session_date and topic are required to create a new class session',
-        });
-      }
-
-      const { data: newClass, error: createClassError } = await supabaseAdmin
-        .from('classes')
-        .insert({
-          mentor_id: mentorId,
-          course_id: course_id || null,
-          session_date,
-          topic: topic.trim(),
-        })
-        .select('*')
-        .single();
-
-      if (createClassError) {
-        return res.status(500).json({ error: createClassError.message });
-      }
-
-      targetClassId = newClass.id;
-      classRecord = newClass;
-    }
-
-    // Fetch existing attendance records for this class to update or insert
-    const { data: existingAttendance } = await supabaseAdmin
-      .from('attendance')
-      .select('id, student_id')
-      .eq('class_id', targetClassId);
-
-    const existingMap = new Map((existingAttendance || []).map((a) => [a.student_id, a.id]));
-
-    const results = [];
-    for (const record of records) {
-      const existingId = existingMap.get(record.student_id);
-      if (existingId) {
-        const { data: updated, error: updateErr } = await supabaseAdmin
-          .from('attendance')
-          .update({ status: record.status })
-          .eq('id', existingId)
-          .select('id, class_id, student_id, status')
-          .single();
-
-        if (!updateErr && updated) {
-          results.push(updated);
-        }
-      } else {
-        const { data: inserted, error: insertErr } = await supabaseAdmin
-          .from('attendance')
-          .insert({
-            class_id: targetClassId,
-            student_id: record.student_id,
-            status: record.status,
-          })
-          .select('id, class_id, student_id, status')
-          .single();
-
-        if (!insertErr && inserted) {
-          results.push(inserted);
-        }
-      }
-    }
-
-    return res.json({
-      success: true,
-      class: classRecord,
-      attendance: results,
-    });
-  } catch (err) {
-    console.error('Error marking attendance:', err);
-    return res.status(500).json({ error: 'Internal server error marking attendance' });
-  }
-});
-
-/**
- * GET /api/mentors/me/classes
- * Get all class sessions created by this mentor
- */
-router.get('/me/classes', async (req, res) => {
-  try {
-    const mentorId = req.user.id;
-
-    const { data: classes, error: classesError } = await supabaseAdmin
-      .from('classes')
-      .select('id, course_id, session_date, topic')
-      .eq('mentor_id', mentorId)
-      .order('session_date', { ascending: false });
-
-    if (classesError) {
-      return res.status(500).json({ error: classesError.message });
-    }
-
-    if (!classes || classes.length === 0) {
-      return res.json([]);
-    }
-
-    const courseIds = [...new Set(classes.map((c) => c.course_id).filter(Boolean))];
-    let courseMap = new Map();
-    if (courseIds.length > 0) {
-      const { data: courses } = await supabaseAdmin
-        .from('courses')
-        .select('id, name')
-        .in('id', courseIds);
-      courseMap = new Map((courses || []).map((c) => [c.id, c.name]));
-    }
-
-    const classIds = classes.map((c) => c.id);
-    const { data: attendanceList } = await supabaseAdmin
-      .from('attendance')
-      .select('class_id, status')
-      .in('class_id', classIds);
-
-    const statsMap = new Map();
-    (attendanceList || []).forEach((att) => {
-      if (!statsMap.has(att.class_id)) {
-        statsMap.set(att.class_id, { total: 0, present: 0, absent: 0, excused: 0 });
-      }
-      const stat = statsMap.get(att.class_id);
-      stat.total += 1;
-      if (att.status === 'present') stat.present += 1;
-      if (att.status === 'absent') stat.absent += 1;
-      if (att.status === 'excused') stat.excused += 1;
-    });
-
-    const enriched = classes.map((cls) => ({
-      id: cls.id,
-      session_date: cls.session_date,
-      topic: cls.topic,
-      course_id: cls.course_id,
-      course_name: cls.course_id ? courseMap.get(cls.course_id) || 'Unknown Course' : 'General Session',
-      stats: statsMap.get(cls.id) || { total: 0, present: 0, absent: 0, excused: 0 },
+    let result = (students || []).map((s) => ({
+      id: s.id,
+      name: profileMap[s.id]?.full_name ?? null,
+      phone: profileMap[s.id]?.phone ?? null,
+      admissionStage: s.admission_stage,
+      courseId: s.course_id,
+      courseName: courseMap[s.course_id] || null,
+      mentorId: s.mentor_id,
+      mentorName: mentorMap[s.mentor_id] || null,
+      universityId: s.university_id,
+      bio: s.bio,
     }));
 
-    return res.json(enriched);
+    if (search) {
+      const q = search.toLowerCase();
+      result = result.filter((s) => (s.name || '').toLowerCase().includes(q));
+    }
+
+    return res.json({ students: result });
   } catch (err) {
-    console.error('Error fetching classes:', err);
-    return res.status(500).json({ error: 'Internal server error fetching classes' });
+    return res.status(500).json({ error: 'Failed to load students' });
   }
 });
 
-/**
- * GET /api/mentors/me/classes/:id/attendance
- * Get attendance records for a specific class
- */
-router.get('/me/classes/:id/attendance', async (req, res) => {
+// POST /api/admin/students — create a new student account
+router.post('/students', async (req, res) => {
+  const { email, password, full_name, phone, course_id, mentor_id, university_id, admission_stage, bio } = req.body || {};
+
+  if (!email || !password || !full_name) {
+    return res.status(400).json({ error: 'email, password and full_name are required' });
+  }
+  if (admission_stage && !ADMISSION_STAGES.includes(admission_stage)) {
+    return res.status(400).json({ error: `admission_stage must be one of ${ADMISSION_STAGES.join(', ')}` });
+  }
+
   try {
-    const mentorId = req.user.id;
-    const classId = req.params.id;
+    const userId = await createAuthUser({ email, password, full_name, role: 'student', phone });
 
-    // Verify class ownership
-    const { data: cls, error: classErr } = await supabaseAdmin
-      .from('classes')
-      .select('*')
-      .eq('id', classId)
-      .eq('mentor_id', mentorId)
-      .single();
+    const client = db(req);
+    const { error: studentError } = await client.from('students').insert({
+      id: userId,
+      admission_stage: admission_stage || 'looking',
+      course_id: course_id || null,
+      mentor_id: mentor_id || null,
+      university_id: university_id || null,
+      bio: bio || null,
+    });
+    if (studentError) throw studentError;
 
-    if (classErr || !cls) {
-      return res.status(404).json({ error: 'Class not found or not owned by you' });
+    return res.status(201).json({ id: userId });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to create student' });
+  }
+});
+
+const STUDENT_FIELDS = ['admission_stage', 'course_id', 'mentor_id', 'university_id', 'bio'];
+const PROFILE_FIELDS = ['full_name', 'phone'];
+
+// PUT /api/admin/students/:id — full edit access (admin only)
+router.put('/students/:id', async (req, res) => {
+  const { id } = req.params;
+  const body = req.body || {};
+
+  if ('admission_stage' in body && !ADMISSION_STAGES.includes(body.admission_stage)) {
+    return res.status(400).json({ error: `admission_stage must be one of ${ADMISSION_STAGES.join(', ')}` });
+  }
+
+  const client = db(req);
+  try {
+    const studentUpdate = {};
+    STUDENT_FIELDS.forEach((f) => {
+      if (f in body) studentUpdate[f] = body[f];
+    });
+    const profileUpdate = {};
+    PROFILE_FIELDS.forEach((f) => {
+      if (f in body) profileUpdate[f] = body[f];
+    });
+
+    if (Object.keys(studentUpdate).length > 0) {
+      const { error } = await client.from('students').update(studentUpdate).eq('id', id);
+      if (error) throw error;
+    }
+    if (Object.keys(profileUpdate).length > 0) {
+      const { error } = await client.from('users_profile').update(profileUpdate).eq('id', id);
+      if (error) throw error;
     }
 
-    const { data: attendanceRecords } = await supabaseAdmin
-      .from('attendance')
-      .select('id, student_id, status')
-      .eq('class_id', classId);
+    return res.json({ id });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update student' });
+  }
+});
+
+// DELETE /api/admin/students/:id
+router.delete('/students/:id', async (req, res) => {
+  try {
+    const { error } = await supabaseAdmin.auth.admin.deleteUser(req.params.id);
+    if (error) throw error;
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete student' });
+  }
+});
+
+// ===================================================================
+// MENTORS / TEACHERS
+// ===================================================================
+
+// GET /api/admin/mentors — list with current workload (student count)
+router.get('/mentors', async (req, res) => {
+  const client = db(req);
+  try {
+    const { data: mentors, error } = await client.from('mentors').select('id, expertise, max_students');
+    if (error) throw error;
+
+    const ids = (mentors || []).map((m) => m.id);
+    const [{ data: profiles }, { data: students }] = await Promise.all([
+      ids.length ? client.from('users_profile').select('id, full_name, phone, role').in('id', ids) : Promise.resolve({ data: [] }),
+      ids.length ? client.from('students').select('id, mentor_id').in('mentor_id', ids) : Promise.resolve({ data: [] }),
+    ]);
+
+    const profileMap = Object.fromEntries((profiles || []).map((p) => [p.id, p]));
+    const workload = {};
+    (students || []).forEach((s) => {
+      workload[s.mentor_id] = (workload[s.mentor_id] || 0) + 1;
+    });
+
+    const result = (mentors || []).map((m) => ({
+      id: m.id,
+      name: profileMap[m.id]?.full_name ?? null,
+      phone: profileMap[m.id]?.phone ?? null,
+      role: profileMap[m.id]?.role ?? 'mentor',
+      expertise: m.expertise || [],
+      maxStudents: m.max_students || 0,
+      currentStudents: workload[m.id] || 0,
+    }));
+
+    return res.json({ mentors: result });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load mentors' });
+  }
+});
+
+// POST /api/admin/mentors — onboard a new mentor/teacher
+router.post('/mentors', async (req, res) => {
+  const { email, password, full_name, phone, role, expertise, max_students } = req.body || {};
+
+  if (!email || !password || !full_name) {
+    return res.status(400).json({ error: 'email, password and full_name are required' });
+  }
+  const mentorRole = STAFF_ROLES.includes(role) ? role : 'mentor';
+
+  try {
+    const userId = await createAuthUser({ email, password, full_name, role: mentorRole, phone });
+
+    const client = db(req);
+    const { error: mentorError } = await client.from('mentors').insert({
+      id: userId,
+      expertise: Array.isArray(expertise) ? expertise : [],
+      max_students: Number.isFinite(max_students) ? max_students : 0,
+    });
+    if (mentorError) throw mentorError;
+
+    return res.status(201).json({ id: userId });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to create mentor' });
+  }
+});
+
+// PUT /api/admin/mentors/:id
+router.put('/mentors/:id', async (req, res) => {
+  const { id } = req.params;
+  const { full_name, phone, expertise, max_students } = req.body || {};
+  const client = db(req);
+
+  try {
+    const profileUpdate = {};
+    if (full_name !== undefined) profileUpdate.full_name = full_name;
+    if (phone !== undefined) profileUpdate.phone = phone;
+    if (Object.keys(profileUpdate).length > 0) {
+      const { error } = await client.from('users_profile').update(profileUpdate).eq('id', id);
+      if (error) throw error;
+    }
+
+    const mentorUpdate = {};
+    if (expertise !== undefined) mentorUpdate.expertise = Array.isArray(expertise) ? expertise : [];
+    if (max_students !== undefined) mentorUpdate.max_students = max_students;
+    if (Object.keys(mentorUpdate).length > 0) {
+      const { error } = await client.from('mentors').update(mentorUpdate).eq('id', id);
+      if (error) throw error;
+    }
+
+    return res.json({ id });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update mentor' });
+  }
+});
+
+// DELETE /api/admin/mentors/:id
+router.delete('/mentors/:id', async (req, res) => {
+  try {
+    const { error } = await supabaseAdmin.auth.admin.deleteUser(req.params.id);
+    if (error) throw error;
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete mentor' });
+  }
+});
+
+// ===================================================================
+// MATCHING — assign/reassign mentor <-> student
+// ===================================================================
+
+// POST /api/admin/match — body { student_id, mentor_id } (mentor_id may be
+// null to unassign)
+router.post('/match', async (req, res) => {
+  const { student_id, mentor_id } = req.body || {};
+  if (!student_id) {
+    return res.status(400).json({ error: 'student_id is required' });
+  }
+
+  const client = db(req);
+  try {
+    if (mentor_id) {
+      const { data: mentor, error: mentorError } = await client
+        .from('mentors')
+        .select('id, max_students')
+        .eq('id', mentor_id)
+        .maybeSingle();
+      if (mentorError) throw mentorError;
+      if (!mentor) {
+        return res.status(404).json({ error: 'Mentor not found' });
+      }
+
+      if (mentor.max_students > 0) {
+        const { count, error: countError } = await client
+          .from('students')
+          .select('id', { count: 'exact', head: true })
+          .eq('mentor_id', mentor_id)
+          .neq('id', student_id);
+        if (countError) throw countError;
+        if ((count || 0) >= mentor.max_students) {
+          return res.status(400).json({ error: 'This mentor is already at maximum capacity' });
+        }
+      }
+    }
+
+    const { data: updated, error } = await client
+      .from('students')
+      .update({ mentor_id: mentor_id || null })
+      .eq('id', student_id)
+      .select('id, mentor_id')
+      .single();
+    if (error) throw error;
+
+    return res.json({ student_id: updated.id, mentor_id: updated.mentor_id });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update mentor assignment' });
+  }
+});
+
+// ===================================================================
+// COURSES
+// ===================================================================
+
+router.get('/courses', async (req, res) => {
+  try {
+    const { data, error } = await db(req).from('courses').select('*').order('name');
+    if (error) throw error;
+    return res.json({ courses: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load courses' });
+  }
+});
+
+router.post('/courses', async (req, res) => {
+  const { name, description, category } = req.body || {};
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  try {
+    const { data, error } = await db(req)
+      .from('courses')
+      .insert({ name: name.trim(), description: description || null, category: category || null })
+      .select()
+      .single();
+    if (error) throw error;
+    return res.status(201).json({ course: data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to create course' });
+  }
+});
+
+router.put('/courses/:id', async (req, res) => {
+  const { name, description, category } = req.body || {};
+  const update = {};
+  if (name !== undefined) update.name = name;
+  if (description !== undefined) update.description = description;
+  if (category !== undefined) update.category = category;
+
+  try {
+    const { data, error } = await db(req).from('courses').update(update).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    return res.json({ course: data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update course' });
+  }
+});
+
+router.delete('/courses/:id', async (req, res) => {
+  try {
+    const { error } = await db(req).from('courses').delete().eq('id', req.params.id);
+    if (error) throw error;
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete course' });
+  }
+});
+
+// ===================================================================
+// UNIVERSITIES / FELLOWSHIPS
+// ===================================================================
+
+router.get('/universities', async (req, res) => {
+  const client = db(req);
+  try {
+    const { data: universities, error } = await client.from('universities').select('*').order('name');
+    if (error) throw error;
+
+    const ids = (universities || []).map((u) => u.id);
+    const { data: categoryRows } = ids.length
+      ? await client.from('university_categories').select('university_id, category').in('university_id', ids)
+      : { data: [] };
+
+    const categoryMap = {};
+    (categoryRows || []).forEach((row) => {
+      (categoryMap[row.university_id] ||= []).push(row.category);
+    });
 
     return res.json({
-      class: cls,
-      records: attendanceRecords || [],
+      universities: (universities || []).map((u) => ({ ...u, categories: categoryMap[u.id] || [] })),
     });
   } catch (err) {
-    console.error('Error fetching class attendance:', err);
-    return res.status(500).json({ error: 'Internal server error fetching class attendance' });
+    return res.status(500).json({ error: 'Failed to load universities' });
   }
 });
 
-/**
- * GET /api/mentors/me/courses
- * Get list of available courses for class session creation
- */
-router.get('/me/courses', async (req, res) => {
-  try {
-    const { data: courses, error } = await supabaseAdmin
-      .from('courses')
-      .select('id, name, description, category')
-      .order('name');
+async function replaceCategories(client, universityId, categories) {
+  if (!Array.isArray(categories)) return;
+  const { error: deleteError } = await client.from('university_categories').delete().eq('university_id', universityId);
+  if (deleteError) throw deleteError;
+  const rows = categories.filter(Boolean).map((category) => ({ university_id: universityId, category }));
+  if (rows.length > 0) {
+    const { error: insertError } = await client.from('university_categories').insert(rows);
+    if (insertError) throw insertError;
+  }
+}
 
-    if (error) {
-      return res.status(500).json({ error: error.message });
+router.post('/universities', async (req, res) => {
+  const { name, country, fellowship_available, categories } = req.body || {};
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  const client = db(req);
+  try {
+    const { data: university, error } = await client
+      .from('universities')
+      .insert({ name: name.trim(), country: country || null, fellowship_available: !!fellowship_available })
+      .select()
+      .single();
+    if (error) throw error;
+
+    await replaceCategories(client, university.id, categories);
+
+    return res.status(201).json({ university: { ...university, categories: categories || [] } });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to create university' });
+  }
+});
+
+router.put('/universities/:id', async (req, res) => {
+  const { name, country, fellowship_available, categories } = req.body || {};
+  const update = {};
+  if (name !== undefined) update.name = name;
+  if (country !== undefined) update.country = country;
+  if (fellowship_available !== undefined) update.fellowship_available = !!fellowship_available;
+
+  const client = db(req);
+  try {
+    let university;
+    if (Object.keys(update).length > 0) {
+      const { data, error } = await client.from('universities').update(update).eq('id', req.params.id).select().single();
+      if (error) throw error;
+      university = data;
+    }
+    await replaceCategories(client, req.params.id, categories);
+
+    if (!university) {
+      const { data } = await client.from('universities').select('*').eq('id', req.params.id).single();
+      university = data;
     }
 
-    return res.json(courses || []);
+    return res.json({ university: { ...university, categories: categories || [] } });
   } catch (err) {
-    console.error('Error fetching courses:', err);
-    return res.status(500).json({ error: 'Internal server error fetching courses' });
+    return res.status(500).json({ error: 'Failed to update university' });
+  }
+});
+
+router.delete('/universities/:id', async (req, res) => {
+  try {
+    const { error } = await db(req).from('universities').delete().eq('id', req.params.id);
+    if (error) throw error;
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete university' });
+  }
+});
+
+// ===================================================================
+// USERS / ROLES
+// ===================================================================
+
+// GET /api/admin/users — every account, with email (requires the Admin
+// Auth API, which is only reachable with the service-role key — there is
+// no RLS-scoped way to read auth.users).
+router.get('/users', async (req, res) => {
+  try {
+    const [{ data: profiles, error: profileError }, { data: authList, error: authError }] = await Promise.all([
+      db(req).from('users_profile').select('id, full_name, role, phone, created_at'),
+      supabaseAdmin.auth.admin.listUsers({ perPage: 1000 }),
+    ]);
+    if (profileError) throw profileError;
+    if (authError) throw authError;
+
+    const emailMap = Object.fromEntries((authList?.users || []).map((u) => [u.id, u.email]));
+
+    return res.json({
+      users: (profiles || []).map((p) => ({ ...p, email: emailMap[p.id] || null })),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to load users' });
+  }
+});
+
+// POST /api/admin/users — invite/create a user of any role
+router.post('/users', async (req, res) => {
+  const { email, password, full_name, role, phone } = req.body || {};
+  if (!email || !password || !full_name || !role) {
+    return res.status(400).json({ error: 'email, password, full_name and role are required' });
+  }
+  if (!ALL_ROLES.includes(role)) {
+    return res.status(400).json({ error: `role must be one of ${ALL_ROLES.join(', ')}` });
+  }
+
+  try {
+    const userId = await createAuthUser({ email, password, full_name, role, phone });
+
+    const client = db(req);
+    if (role === 'student') {
+      await client.from('students').insert({ id: userId, admission_stage: 'looking' });
+    } else if (STAFF_ROLES.includes(role)) {
+      await client.from('mentors').insert({ id: userId });
+    }
+
+    return res.status(201).json({ id: userId, role });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message || 'Failed to create user' });
+  }
+});
+
+// PATCH /api/admin/users/:id — update role/profile fields
+router.patch('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const { role, full_name, phone } = req.body || {};
+
+  if (role && !ALL_ROLES.includes(role)) {
+    return res.status(400).json({ error: `role must be one of ${ALL_ROLES.join(', ')}` });
+  }
+
+  const client = db(req);
+  try {
+    const update = {};
+    if (role !== undefined) update.role = role;
+    if (full_name !== undefined) update.full_name = full_name;
+    if (phone !== undefined) update.phone = phone;
+
+    if (Object.keys(update).length > 0) {
+      const { error } = await client.from('users_profile').update(update).eq('id', id);
+      if (error) throw error;
+    }
+
+    // Changing into student/mentor role needs the matching extension row to
+    // exist (it won't, if the account started life as a different role).
+    if (role === 'student') {
+      const { data: existing } = await client.from('students').select('id').eq('id', id).maybeSingle();
+      if (!existing) {
+        await client.from('students').insert({ id, admission_stage: 'looking' });
+      }
+    } else if (STAFF_ROLES.includes(role)) {
+      const { data: existing } = await client.from('mentors').select('id').eq('id', id).maybeSingle();
+      if (!existing) {
+        await client.from('mentors').insert({ id });
+      }
+    }
+
+    return res.json({ id });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// DELETE /api/admin/users/:id
+router.delete('/users/:id', async (req, res) => {
+  if (req.params.id === req.user.id) {
+    return res.status(400).json({ error: 'You cannot delete your own account' });
+  }
+  try {
+    const { error } = await supabaseAdmin.auth.admin.deleteUser(req.params.id);
+    if (error) throw error;
+    return res.status(204).send();
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+// ===================================================================
+// ANALYTICS
+// ===================================================================
+
+// GET /api/admin/analytics/overview
+router.get('/analytics/overview', async (req, res) => {
+  const client = db(req);
+  try {
+    const [{ data: students }, { data: attendance }, { data: results }, { data: courses }] = await Promise.all([
+      client.from('students').select('admission_stage, course_id'),
+      client.from('attendance').select('status'),
+      client.from('test_results').select('score, test_id'),
+      client.from('courses').select('id, name'),
+    ]);
+
+    const funnel = { looking: 0, applied: 0, offer_received: 0 };
+    (students || []).forEach((s) => {
+      if (funnel[s.admission_stage] !== undefined) funnel[s.admission_stage] += 1;
+    });
+
+    const attendanceTotal = (attendance || []).length;
+    const attendancePresent = (attendance || []).filter((a) => a.status === 'present').length;
+    const attendanceRate = attendanceTotal > 0 ? Math.round((attendancePresent / attendanceTotal) * 100) : 0;
+
+    const validScores = (results || []).filter((r) => r.score !== null && !Number.isNaN(Number(r.score)));
+    const averageScore =
+      validScores.length > 0
+        ? Math.round(validScores.reduce((sum, r) => sum + Number(r.score), 0) / validScores.length)
+        : 0;
+
+    // Average score by course requires joining test_results -> tests -> course_id.
+    const { data: tests } = await client.from('tests').select('id, course_id');
+    const testCourseMap = Object.fromEntries((tests || []).map((t) => [t.id, t.course_id]));
+    const courseNameMap = Object.fromEntries((courses || []).map((c) => [c.id, c.name]));
+
+    const scoresByCourse = {};
+    validScores.forEach((r) => {
+      const courseId = testCourseMap[r.test_id];
+      if (!courseId) return;
+      (scoresByCourse[courseId] ||= []).push(Number(r.score));
+    });
+    const averageScoreByCourse = Object.entries(scoresByCourse).map(([courseId, scores]) => ({
+      courseId,
+      courseName: courseNameMap[courseId] || 'Unknown',
+      averageScore: Math.round(scores.reduce((a, b) => a + b, 0) / scores.length),
+      count: scores.length,
+    }));
+
+    const studentsByCourse = {};
+    (students || []).forEach((s) => {
+      if (!s.course_id) return;
+      studentsByCourse[s.course_id] = (studentsByCourse[s.course_id] || 0) + 1;
+    });
+
+    return res.json({
+      admissionFunnel: funnel,
+      totalStudents: (students || []).length,
+      attendance: { total: attendanceTotal, present: attendancePresent, rate: attendanceRate },
+      testScores: { average: averageScore, totalSubmissions: validScores.length, byCourse: averageScoreByCourse },
+      studentsByCourse: Object.entries(studentsByCourse).map(([courseId, count]) => ({
+        courseId,
+        courseName: courseNameMap[courseId] || 'Unknown',
+        count,
+      })),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to compute analytics overview' });
+  }
+});
+
+// GET /api/admin/analytics/universities — applicants per university
+router.get('/analytics/universities', async (req, res) => {
+  const client = db(req);
+  try {
+    const [{ data: universities }, { data: students }] = await Promise.all([
+      client.from('universities').select('id, name, country, fellowship_available'),
+      client.from('students').select('university_id'),
+    ]);
+
+    const counts = {};
+    (students || []).forEach((s) => {
+      if (!s.university_id) return;
+      counts[s.university_id] = (counts[s.university_id] || 0) + 1;
+    });
+
+    const result = (universities || [])
+      .map((u) => ({ ...u, applicantCount: counts[u.id] || 0 }))
+      .sort((a, b) => b.applicantCount - a.applicantCount);
+
+    return res.json({ universities: result });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to compute university analytics' });
   }
 });
 

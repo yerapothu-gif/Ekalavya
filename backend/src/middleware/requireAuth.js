@@ -1,4 +1,4 @@
-const { supabaseAnon } = require('../supabaseClient');
+const { supabaseAnon, createScopedClient } = require('../supabaseClient');
 
 // Verifies the Supabase JWT sent in the Authorization header and attaches
 // req.user (Supabase auth user) + req.profile (users_profile row) so every
@@ -17,7 +17,13 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  const { data: profile, error: profileError } = await supabaseAnon
+  // Scoped to the caller's own verified JWT so this query runs under RLS as
+  // that user (auth.uid() = data.user.id), not as anonymous. Querying via
+  // supabaseAnon here would run with no auth.uid() context, so a
+  // users_profile_select_own RLS policy would never match and every valid
+  // user would get "No profile found" below.
+  const scopedDb = createScopedClient(token);
+  const { data: profile, error: profileError } = await scopedDb
     .from('users_profile')
     .select('*')
     .eq('id', data.user.id)

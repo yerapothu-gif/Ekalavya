@@ -1,9 +1,8 @@
 import { Component } from 'react';
 
-// Wraps embedded components owned by other in-progress branches (Tests,
-// AI Summary). Those are still "Coming soon" stubs today; once merged, this
-// boundary keeps a future incompatible export from crashing the whole
-// dashboard instead of just that one panel.
+// Wraps embedded components owned by other feature folders (Tests, AI
+// Summary). Keeps a crash in one of those panels from taking down the
+// whole dashboard instead of just that section.
 export default class ExternalPanelBoundary extends Component {
   state = { hasError: false };
 
@@ -13,7 +12,11 @@ export default class ExternalPanelBoundary extends Component {
 
   render() {
     if (this.state.hasError) {
-      return <div style={{ color: 'var(--text-muted)' }}>Coming soon</div>;
+      return (
+        <div style={{ color: 'var(--text-muted)' }}>
+          This section is temporarily unavailable. Please try reloading the page.
+        </div>
+      );
     }
     return this.props.children;
   }

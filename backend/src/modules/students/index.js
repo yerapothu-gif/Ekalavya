@@ -1,21 +1,9 @@
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
-const { supabaseAdmin } = require('../../supabaseClient');
+const { createScopedClient: scopedClient } = require('../../supabaseClient');
 const requireAuth = require('../../middleware/requireAuth');
 const requireRole = require('../../middleware/requireRole');
 
 const router = express.Router();
-
-// Per-request client scoped to the caller's own JWT so Postgres RLS
-// (auth.uid()) applies as a second layer of defense on top of the
-// server-side ownership checks below. supabaseClient.js only exports a
-// shared anon/admin pair, so a per-user client is built locally here.
-function scopedClient(token) {
-  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-    auth: { autoRefreshToken: false, persistSession: false },
-    global: { headers: { Authorization: `Bearer ${token}` } },
-  });
-}
 
 // All /api/students/me* routes require an authenticated student. Identity is
 // always resolved from req.user.id (verified JWT) — never from the URL,
@@ -52,12 +40,10 @@ router.get('/me', async (req, res) => {
     if (student.mentor_id) {
       const [{ data: mentorRow }, { data: mentorProfile }] = await Promise.all([
         db.from('mentors').select('id, expertise, max_students').eq('id', student.mentor_id).single(),
-        // users_profile RLS only allows selecting your own row, so a student
-        // can't read their mentor's name/phone through the scoped client.
-        // This single lookup uses the service-role client instead, strictly
-        // scoped to the mentor id already resolved from the student's own
-        // (RLS-verified) record above — never client-supplied.
-        supabaseAdmin.from('users_profile').select('id, full_name, phone').eq('id', student.mentor_id).single(),
+        // users_profile_select_assigned_mentor now allows a student to read
+        // their own mentor's profile row, so this runs through the scoped
+        // (RLS-enforced) client rather than the service-role one.
+        db.from('users_profile').select('id, full_name, phone').eq('id', student.mentor_id).single(),
       ]);
 
       if (mentorRow || mentorProfile) {
@@ -124,20 +110,21 @@ router.put('/me', async (req, res) => {
   }
 
   try {
+    // students_update_own and users_profile_update_own both exist now, so
+    // every write here runs through the RLS-scoped client (auth.uid() =
+    // studentId), never the service-role client. The row is always scoped
+    // to req.user.id from the verified JWT, never a client-supplied id;
+    // which fields may be set is enforced above by the EDITABLE_FIELDS
+    // allowlist, not by RLS.
+    const writeDb = scopedClient(req.token);
+
     if (bio !== undefined) {
-      // students has no "update own row" RLS policy (only mentor/admin may
-      // update it), so this write uses the service-role client. It stays
-      // safe because the row is always scoped to req.user.id from the
-      // verified JWT, never a client-supplied id.
-      const { error } = await supabaseAdmin.from('students').update({ bio }).eq('id', studentId);
+      const { error } = await writeDb.from('students').update({ bio }).eq('id', studentId);
       if (error) throw error;
     }
 
     if (phone !== undefined) {
-      // users_profile_update_own exists, so the RLS-scoped client can do
-      // this write and stay covered by RLS as a second layer of defense.
-      const db = scopedClient(req.token);
-      const { error } = await db.from('users_profile').update({ phone }).eq('id', studentId);
+      const { error } = await writeDb.from('users_profile').update({ phone }).eq('id', studentId);
       if (error) throw error;
     }
   } catch (err) {
@@ -145,10 +132,6 @@ router.put('/me', async (req, res) => {
   }
 
   try {
-    // Both students_select_own and users_profile_select_own exist, so the
-    // confirmation read-back goes through the RLS-scoped client rather than
-    // the service-role one — service-role is reserved for the bio write
-    // above, which is the only operation actually blocked by RLS.
     const db = scopedClient(req.token);
     const { data: student, error: studentError } = await db
       .from('students')
@@ -220,14 +203,11 @@ router.get('/me/attendance', async (req, res) => {
   }
 });
 
-// GET /api/students/me/universities — universities/fellowships, intended to
-// be filtered by the student's course category.
-//
-// LIMITATION: the schema (db/schema.sql, frozen/out of scope) has no field
-// or join linking `universities` to a course category — `universities` only
-// has name/country/fellowship_available. There is nothing safe to filter on,
-// so this returns the full university list alongside the student's course
-// rather than fabricating a category match or scoring system.
+// GET /api/students/me/universities — universities/fellowships filtered by
+// the student's course category via the university_categories join table.
+// If the student has no course, or their course has no category, there is
+// nothing to filter by, so the full university list is returned instead of
+// fabricating a match.
 router.get('/me/universities', async (req, res) => {
   const studentId = req.user.id;
   const db = scopedClient(req.token);
@@ -253,16 +233,26 @@ router.get('/me/universities', async (req, res) => {
       course = data || null;
     }
 
-    const { data: universities, error } = await db
-      .from('universities')
-      .select('id, name, country, fellowship_available')
-      .order('name', { ascending: true });
+    const universitiesQuery = course?.category
+      ? db
+          .from('universities')
+          .select('id, name, country, fellowship_available, university_categories!inner(category)')
+          .eq('university_categories.category', course.category)
+          .order('name', { ascending: true })
+      : db
+          .from('universities')
+          .select('id, name, country, fellowship_available')
+          .order('name', { ascending: true });
+
+    const { data: rawUniversities, error } = await universitiesQuery;
 
     if (error) {
       return res.status(500).json({ error: 'Failed to load universities' });
     }
 
-    return res.json({ course, universities: universities || [] });
+    const universities = (rawUniversities || []).map(({ university_categories, ...university }) => university);
+
+    return res.json({ course, universities });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to load universities' });
   }

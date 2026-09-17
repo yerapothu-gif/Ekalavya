@@ -36,6 +36,20 @@ create table if not exists universities (
 );
 
 -- ============================================================
+-- university_categories — many-to-many: which course categories
+-- (courses.category, a free-text field) each university is relevant to.
+-- Lets the Student Dashboard filter suggested universities by the
+-- student's own course category without fabricating a per-course link.
+-- ============================================================
+create table if not exists university_categories (
+  university_id  uuid not null references universities(id) on delete cascade,
+  category       text not null,
+  primary key (university_id, category)
+);
+
+create index if not exists idx_university_categories_category on university_categories(category);
+
+-- ============================================================
 -- mentors — extends users_profile
 -- ============================================================
 create table if not exists mentors (

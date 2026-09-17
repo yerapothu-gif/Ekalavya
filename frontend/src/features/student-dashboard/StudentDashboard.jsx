@@ -9,8 +9,6 @@ import ProfileSection from './components/ProfileSection.jsx';
 import AttendanceTable from './components/AttendanceTable.jsx';
 import UniversityList from './components/UniversityList.jsx';
 import ExternalPanelBoundary from './components/ExternalPanelBoundary.jsx';
-// Owned by Person 4 / Person 6. Both are still "Coming soon" stubs until
-// their branches merge — rendered here, never rebuilt.
 import TestAttempt from '../tests/TestAttempt';
 import SummaryPanel from '../ai-summary/SummaryPanel';
 
@@ -108,7 +106,7 @@ export default function StudentDashboard() {
 
       {tab === 'summary' && (
         <ExternalPanelBoundary>
-          <SummaryPanel />
+          <SummaryPanel studentId={session?.user?.id} viewerRole="student" />
         </ExternalPanelBoundary>
       )}
     </div>

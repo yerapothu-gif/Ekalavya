@@ -1,72 +1,55 @@
-import React, { useState } from 'react';
-import './AdminDashboard.css';
-import AnalyticsTab from './AnalyticsTab';
-import StudentsTab from './StudentsTab';
-import MentorsTab from './MentorsTab';
-import CoursesUnivsTab from './CoursesUnivsTab';
-import UsersTab from './UsersTab';
+import { useState } from 'react';
+import StudentsTab from './components/StudentsTab.jsx';
+import MentorsTab from './components/MentorsTab.jsx';
+import CoursesUniversitiesTab from './components/CoursesUniversitiesTab.jsx';
+import UsersTab from './components/UsersTab.jsx';
+import AnalyticsTab from './components/AnalyticsTab.jsx';
+
+const TABS = [
+  { key: 'students', label: 'Students', Component: StudentsTab },
+  { key: 'mentors', label: 'Mentors', Component: MentorsTab },
+  { key: 'courses', label: 'Courses & Universities', Component: CoursesUniversitiesTab },
+  { key: 'users', label: 'Users', Component: UsersTab },
+  { key: 'analytics', label: 'Analytics', Component: AnalyticsTab },
+];
 
 export default function AdminDashboard() {
-  const [activeTab, setActiveTab] = useState('analytics');
-
-  const renderTab = () => {
-    switch (activeTab) {
-      case 'analytics':
-        return <AnalyticsTab />;
-      case 'students':
-        return <StudentsTab />;
-      case 'mentors':
-        return <MentorsTab />;
-      case 'courses':
-        return <CoursesUnivsTab />;
-      case 'users':
-        return <UsersTab />;
-      default:
-        return <AnalyticsTab />;
-    }
-  };
+  const [tab, setTab] = useState('students');
+  const Active = TABS.find((t) => t.key === tab)?.Component || StudentsTab;
 
   return (
-    <div className="admin-dashboard">
-      <header className="admin-header">
-        <h1>Admin Dashboard</h1>
-        <nav className="admin-nav">
-          <button 
-            className={activeTab === 'analytics' ? 'active' : ''} 
-            onClick={() => setActiveTab('analytics')}
-          >
-            Analytics
-          </button>
-          <button 
-            className={activeTab === 'students' ? 'active' : ''} 
-            onClick={() => setActiveTab('students')}
-          >
-            Students
-          </button>
-          <button 
-            className={activeTab === 'mentors' ? 'active' : ''} 
-            onClick={() => setActiveTab('mentors')}
-          >
-            Mentors
-          </button>
-          <button 
-            className={activeTab === 'courses' ? 'active' : ''} 
-            onClick={() => setActiveTab('courses')}
-          >
-            Courses & Univs
-          </button>
-          <button 
-            className={activeTab === 'users' ? 'active' : ''} 
-            onClick={() => setActiveTab('users')}
-          >
-            Users
-          </button>
-        </nav>
-      </header>
+    <div>
+      <h2>Admin Dashboard</h2>
 
-      <main className="admin-content">
-        {renderTab()}
-      </main>
+      <div
+        role="tablist"
+        style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border)', marginBottom: 20, flexWrap: 'wrap' }}
+      >
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.key}
+            onClick={() => setTab(t.key)}
+            style={{
+              border: 'none',
+              borderRadius: 0,
+              borderBottom: tab === t.key ? '2px solid var(--accent)' : '2px solid transparent',
+              background: 'transparent',
+              color: tab === t.key ? 'var(--text)' : 'var(--text-muted)',
+              fontWeight: tab === t.key ? 700 : 500,
+              padding: '8px 4px',
+              marginRight: 12,
+              cursor: 'pointer',
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <Active />
     </div>
   );
 }
