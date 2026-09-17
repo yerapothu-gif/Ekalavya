@@ -695,7 +695,4 @@ router.get('/analytics/universities', async (req, res) => {
   }
 });
 
-// Mentor workload is already returned by GET /mentors (currentStudents /
-// maxStudents), which the Analytics tab reuses instead of duplicating here.
-
 module.exports = router;
