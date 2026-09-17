@@ -5,7 +5,7 @@ import { useAuth } from '../context/AuthContext.jsx';
 export default function Signup() {
   const { signup } = useAuth();
   const navigate = useNavigate();
-  const [form, setForm] = useState({ full_name: '', email: '', password: '', role: 'student', phone: '' });
+  const [form, setForm] = useState({ full_name: '', email: '', password: '', phone: '' });
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -45,19 +45,13 @@ export default function Signup() {
           <label htmlFor="phone">Phone</label>
           <input id="phone" value={form.phone} onChange={update('phone')} />
         </div>
-        <div className="form-row">
-          <label htmlFor="role">Role</label>
-          <select id="role" value={form.role} onChange={update('role')}>
-            <option value="student">Student</option>
-            <option value="mentor">Mentor</option>
-            <option value="teacher">Teacher</option>
-            <option value="admin">Admin</option>
-          </select>
-        </div>
         {error && <p className="error-text">{error}</p>}
         <button type="submit" disabled={submitting} style={{ width: '100%' }}>
           {submitting ? 'Creating account…' : 'Sign up'}
         </button>
+        <p style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
+          Self-signup creates a student account. Mentor, teacher and admin accounts are created by an administrator.
+        </p>
         <p style={{ marginTop: 16, fontSize: 13 }}>
           Already have an account? <Link to="/login">Log in</Link>
         </p>

@@ -33,9 +33,36 @@ create policy users_profile_select_admin on users_profile
 create policy users_profile_update_own on users_profile
   for update using (id = auth.uid());
 
+-- Lets a student read their assigned mentor's profile (name/phone) for the
+-- Student Dashboard mentor card, without exposing any other user's profile.
+-- Scoped narrowly via the student's own (RLS-visible) students row — not a
+-- blanket "all profiles readable" policy.
+create policy users_profile_select_assigned_mentor on users_profile
+  for select using (
+    exists (
+      select 1 from students s
+      where s.mentor_id = users_profile.id
+        and s.id = auth.uid()
+    )
+  );
+
 create policy users_profile_admin_all on users_profile
   for all using (current_user_role() = 'admin')
   with check (current_user_role() = 'admin');
+
+-- Lets a mentor read the profile (name/phone) of a student assigned to
+-- them, for the Mentor Dashboard's student list/detail views (PRD 3).
+-- Mirrors users_profile_select_assigned_mentor above but in the other
+-- direction — scoped to the mentor's own (RLS-visible) students rows,
+-- not a blanket "all profiles readable" policy.
+create policy users_profile_select_mentor_students on users_profile
+  for select using (
+    exists (
+      select 1 from students s
+      where s.id = users_profile.id
+        and s.mentor_id = auth.uid()
+    )
+  );
 
 -- ============================================================
 -- students
@@ -51,6 +78,15 @@ create policy students_mentor_select on students
 
 create policy students_mentor_update on students
   for update using (mentor_id = auth.uid());
+
+-- Lets a student update their own row (needed for PUT /api/students/me,
+-- e.g. bio). RLS only guards which ROW can be touched; which COLUMNS may
+-- change is enforced in the Express layer (EDITABLE_FIELDS allowlist in
+-- backend/src/modules/students/index.js), the same division of
+-- responsibility already used by students_mentor_update above.
+create policy students_update_own on students
+  for update using (id = auth.uid())
+  with check (id = auth.uid());
 
 create policy students_admin_all on students
   for all using (current_user_role() = 'admin')
@@ -111,8 +147,15 @@ alter table mentor_notes enable row level security;
 create policy mentor_notes_mentor_select on mentor_notes
   for select using (mentor_id = auth.uid());
 
+-- Requires both that the note is attributed to the caller AND that the
+-- target student is actually assigned to that mentor — without the second
+-- clause, any mentor could insert a note against any student_id since only
+-- the note's own mentor_id was being checked.
 create policy mentor_notes_mentor_insert on mentor_notes
-  for insert with check (mentor_id = auth.uid());
+  for insert with check (
+    mentor_id = auth.uid()
+    and exists (select 1 from students s where s.id = mentor_notes.student_id and s.mentor_id = auth.uid())
+  );
 
 create policy mentor_notes_admin_select on mentor_notes
   for select using (current_user_role() = 'admin');
@@ -153,6 +196,15 @@ create policy universities_select_all on universities
   for select using (true);
 
 create policy universities_admin_all on universities
+  for all using (current_user_role() = 'admin')
+  with check (current_user_role() = 'admin');
+
+alter table university_categories enable row level security;
+
+create policy university_categories_select_all on university_categories
+  for select using (true);
+
+create policy university_categories_admin_all on university_categories
   for all using (current_user_role() = 'admin')
   with check (current_user_role() = 'admin');
 

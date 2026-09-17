@@ -16,4 +16,15 @@ const supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
-module.exports = { supabaseAdmin, supabaseAnon };
+// Per-request client carrying the caller's own JWT as the Authorization
+// header, so Postgres RLS evaluates auth.uid() as that user rather than as
+// anonymous. Used after requireAuth has verified the token, for the
+// users_profile lookup and by downstream modules for their own queries.
+function createScopedClient(token) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+}
+
+module.exports = { supabaseAdmin, supabaseAnon, createScopedClient };

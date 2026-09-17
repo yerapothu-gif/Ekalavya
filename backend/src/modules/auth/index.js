@@ -4,17 +4,20 @@ const requireAuth = require('../../middleware/requireAuth');
 
 const router = express.Router();
 
-const VALID_ROLES = ['student', 'mentor', 'teacher', 'admin'];
+// Public self-signup only ever creates 'student' accounts. Mentor/teacher
+// and admin accounts are privileged and must be created by an existing
+// admin via POST /api/admin/mentors or POST /api/admin/users (both require
+// requireRole('admin')) — never accepted from an unauthenticated request,
+// which previously let anyone self-register as 'admin'.
+const SELF_SIGNUP_ROLE = 'student';
 
 // POST /api/auth/signup — create Supabase Auth user + users_profile row
 router.post('/signup', async (req, res) => {
-  const { email, password, full_name, role, phone } = req.body || {};
+  const { email, password, full_name, phone } = req.body || {};
+  const role = SELF_SIGNUP_ROLE;
 
-  if (!email || !password || !full_name || !role) {
-    return res.status(400).json({ error: 'email, password, full_name and role are required' });
-  }
-  if (!VALID_ROLES.includes(role)) {
-    return res.status(400).json({ error: `role must be one of ${VALID_ROLES.join(', ')}` });
+  if (!email || !password || !full_name) {
+    return res.status(400).json({ error: 'email, password and full_name are required' });
   }
 
   const { data: created, error: createError } = await supabaseAdmin.auth.admin.createUser({
