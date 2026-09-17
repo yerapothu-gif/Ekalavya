@@ -112,6 +112,7 @@ export default function MentorDashboard() {
               fontWeight: tab === t.key ? 700 : 500,
               padding: '8px 4px',
               marginRight: 12,
+              cursor: 'pointer',
             }}
           >
             {t.label}
