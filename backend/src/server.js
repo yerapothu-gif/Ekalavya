@@ -24,7 +24,11 @@ app.use('/api/tests', testsRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/ai', aiRouter);
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`Eklavya backend listening on port ${PORT}`);
-});
+if (require.main === module) {
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => {
+    console.log(`Eklavya backend listening on port ${PORT}`);
+  });
+}
+
+module.exports = app;
